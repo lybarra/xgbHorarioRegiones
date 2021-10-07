@@ -7,217 +7,253 @@ Created on Tue Jun 15 10:30:02 2021
 import pyodbc
 import pandas as pd
 import glob
+from configparser import ConfigParser
+from ast import literal_eval #para leer dict de cfg
+from datetime import date, timedelta
+from scipy.signal import savgol_filter #filtro suavisador
+
+from xgboost.sklearn import XGBRegressor
+from sklearn.model_selection import GridSearchCV
+
+# Si quisiera plotear
+# import matplotlib.pyplot as plt
+# import seaborn as sns
+# sns.set(rc={'figure.figsize':(17, 8)})
+
+#Hay dos archivos de cfg, uno para informacion privada y otro para datos generales
+#instancio y leo los archivos de conf
+config = ConfigParser()
+privConfig = ConfigParser()
+privConfig.read('private.cfg')
+config.read('config.cfg')
+
+#importo de cfg privada
+pathFeriados = privConfig.get('PATHS','pathFeriados')
+pathEstaciones = privConfig.get('PATHS','pathEstaciones')
+
+#importo de cfg general
+estacionesMet = literal_eval(config.get('REGIONES','estacionesMet'))
+regionesEstaciones = literal_eval(config.get('REGIONES','regionesEstaciones'))
+regionesElectricas = config.get('REGIONES','regionesElectricas').split(',')
+acerias = literal_eval(config.get('ACERIAS','acerias'))
 
 
-
-estaciones =   {10332:'AEROPARQUE AERO',10221:'BAHIA BLANCA AERO',
-                10156:'BUENOS AIRES',10270:'COMODORO RIVADAVIA AERO',
-                10100:'CORDOBA AERO',10105:'CORDOBA OBSERVATORIO',
-                10166:'EZEIZA AERO',10210:'MAR DEL PLATA AERO',
-                10131:'MENDOZA AERO',10132:'MENDOZA OBSERVATORIO',
-                10227:'NEUQUEN AERO',10111:'PILAR OBS.',
-                10489:'RESISTENCIA AERO',10133:'ROSARIO AERO',
-                10012:'SALTA AERO',10017:'TUCUMAN AERO'}
-
-regiones={'LIT':10133,
-           'NEA':10489,
-           'NOA':10017,
-           'COM':10227,
-           'CUY':10132,
-           'GBA':10156,
-           'PBS':10221,
-           'PBN':10111,
-           'PAT':10270,
-           'CEN':10105,
-           'MDP':10210}
-
-reg_elec=['LIT','NEA','NOA','COM','CUY','GBA','BAS','PAT','CEN']
-var_met=['TEMP','HUM','PNM','DD','FF']
-
-path_regelec =r'\\VRANAC\ProSemDi\PRONOSTICO DEMANDA\DB\SMEC_REG_ELEC\*.xls'
-path_age=r'\\VRANAC\ProSemDi\PRONOSTICO DEMANDA\DB\SMEC_AGE\*.xls'
-
-#%%
-
-# Importo Demanda por Regiones Eléctricas
-appended_data = []
-
-for i in glob.glob(path_regelec, recursive=False):
-    df = pd.read_excel(i, skiprows=1)
-    df.rename(columns={'Unnamed: 0':'Dia','Unnamed: 1':'Hora'},inplace=True)
-    df.drop(df[df['Hora'].isna()].index,inplace=True)
-    appended_data.append(df)
-    
-df = pd.concat(appended_data)
+varMeteo=['TEMP','HUM','PNM','DD','FF']
 
 
-df['Dia']=pd.to_datetime(df.Dia,dayfirst=True)
-df['Fecha']=df['Dia'] + pd.to_timedelta(df.Hora, unit='h')
-df.drop(['Hora','Dia'],axis=1,inplace=True)
-df.set_index('Fecha',inplace=True)
-df.sort_index(inplace=True)
-df.asfreq(freq='1H')
+#instancio la conexion a la BD
+conx=pyodbc.connect('DSN={};UID={};PWD={}'.format(privConfig['CONN']['DNS'],
+                                                  privConfig['CONN']['user'],
+                                                  privConfig['CONN']['password']))
 
+#elijo fechas de corte para seleccion de datos y para train-test split
+spDay = date.today()- timedelta(days=90) #si uso tra test split no hace falta
+sinceDay = date.today() - timedelta(days=365*3) #entreno con X anios de historia
+# ACA DEBERIA HACER UN MAX DATE
 
 #%%
 
-# Importo y proceso AGENTES
-appended_data = []
+sqlDem=r"""
+    SELECT TIME.FECHA DIA, TIME.HORA, TOP.RGE_NEMO REGION, SUM(DEM.DEMANDA_REAL_NETA) DEMANDA
+    FROM SINGER.DEMANDA_HORARIA DEM
+    INNER JOIN SINGER.TIEMPOS TIME
+    ON TIME.TIEMPO_ID = DEM.TIEMPO_ID
+    INNER JOIN SINGER.TOPOLOGIAS TOP
+    ON TOP.TOPOLOGIA_ID = DEM.TOPOLOGIA_ID_AGDEM
+    WHERE  TIME.FECHA>{{ts '{} 00:00:00'}} AND 
+        DEM.DEMANDA_REAL_NETA>0 AND 
+        TOP.AGE_NEMO NOT IN ({})
+    GROUP BY TIME.FECHA, TIME.HORA, TOP.RGE_NEMO
+    ORDER BY TOP.RGE_NEMO, TIME.FECHA, TIME.HORA
+    """.format((sinceDay-timedelta(days=1)).strftime("%Y-%m-%d"),
+                str(list(acerias.keys()))[1:-1])
 
-for i in glob.glob(path_age, recursive=False):
-    df_age = pd.read_excel(i, skiprows=1)
-    df_age.rename(columns={'Unnamed: 0':'Dia','Unnamed: 1':'Hora'},inplace=True)
-    df_age.drop(df_age[df_age['Hora'].isna()].index,inplace=True)
-    appended_data.append(df_age)
-    
-df_age = pd.concat(appended_data)
+qryDem = pd.read_sql(sqlDem,conx)
 
-df_age['ALUAR']=df_age.ALUAREUA.fillna(0)+df_age.ALUAMAUZ.fillna(0)
-df_age.drop(['ALUAREUA','ALUAMAUZ'],axis=1,inplace=True)
 
-df_age['Dia']=pd.to_datetime(df_age.Dia,dayfirst=True)
-df_age['Fecha']=df_age['Dia'] + pd.to_timedelta(df_age.Hora, unit='h')
-df_age.drop(['Hora','Dia'],axis=1,inplace=True)
-df_age.set_index('Fecha',inplace=True)
-df_age.sort_index(inplace=True)
-df_age.asfreq(freq='1H')
-df_age.rename(columns={'ACINVCSZ':'ACINDAR','SDERCA1Z':'SIDERCA'},inplace=True)
+qryDem.HORA = qryDem.HORA.astype('int')
+qryDem['Fecha'] = pd.to_datetime(qryDem.DIA) + pd.to_timedelta(qryDem.HORA, unit='h')
+qryDem.set_index('Fecha',inplace=True)
 
-# Junto Reg Elec y Agentes
-df=df.join(df_age)
 
 #%%
 # Importo Feriados
-path_fer = r'\\vranac\ProSemDi\PRONOSTICO DEMANDA\INPUT\FERIADOS.xlsx'
-df_fer=pd.read_excel(path_fer,index_col=0,parse_dates=True)
-df_fer.drop(['Descripcion'],inplace=True,axis=1)
-df_fer.set_index(df_fer.index.date,inplace=True)
+dfFer = pd.read_excel(pathFeriados,index_col=0)
+dfFer.drop(['Descripcion','Tipo'],inplace=True,axis=1) #el tipo de feriado se podría inplementar a futuro
+dfFer.set_index(pd.to_datetime(dfFer.index),inplace=True)
+
 
 #%%
-
-## VARIABLES CATEGORICAS CALENDARIO
-df['Hora']=df.index.hour
-df['Mes']=df.index.month
-df['TipoDia']=df.index.dayofweek
-df['Dia']=df.index.date
-
-## FERIADOS
-df=df.join(df_fer,on='Dia')
-df['Feriado'].fillna(0,inplace=True)
-df['L.Feriado']=df['Feriado'].shift(24)
-df['F.Feriado']=df['Feriado'].shift(-24)
-df['F.Feriado'].fillna(0,inplace=True)
-df['L.Feriado'].fillna(0,inplace=True)
-df['Feriado'].fillna(0,inplace=True)
-
-# DROPEO COLAPSO
-# df.drop(df.loc['2019-06-16',].index,axis=0,inplace=True) # #NUEVO
-
-# VALORES REZAGADOS
-shifted=[]
-for j in reg_elec:
-    for i in range(1,25):
-        df['L{}.{}'.format(i,j)]=df[j].shift(i)
-        shifted.append('L{}.{}'.format(i,j))
-    df.drop(df.head(24).index, axis=0,inplace=True)
-
-#%%
-
-# import seaborn as sns
-# import matplotlib.pyplot as plt
-# sns.set(rc={'figure.figsize':(17, 8)})
-# plt.plot(df.loc['01-01-2021':,'GBA'])
+# ploteo para chequear
+# plt.plot(qryDem[(qryDem['REGION']=='GBA')].loc['01-01-2020':,'DEMANDA'])
 
 #%%
 
 region='GBA'
 
-estacion=estaciones[regiones[region]].replace(" ","")
+estacion=estacionesMet[regionesEstaciones[region]].replace(" ","")
 
 appended_data = []
 
+pathEstacion = pathEstaciones + estacion + '*.csv'
 
-# path =r'\\vranac\ProSemDi\DATOS\SMN\\' + year + '\\**\\rad*.txt'
-estacion_path = r'\\vranac\ProSemDi\DATOS\SMN\\**\\ddhh_' + estacion + '*.csv'
 
-shifted=[region]
-for i in range(1,25):
-        shifted.append('L{}.{}'.format(i,region))
+for i in glob.glob(pathEstacion, recursive=True):
+    dfEst = pd.read_csv(i,sep=',',index_col=0)
+    appended_data.append(dfEst)
+dfEst = pd.concat(appended_data)
+dfEst.set_index(pd.to_datetime(dfEst.index),inplace=True)
 
-for i in glob.glob(estacion_path, recursive=True):
-    df_est = pd.read_csv(i,sep=',',index_col=0)
-    appended_data.append(df_est)    
-df_est = pd.concat(appended_data)
-df_est.set_index(pd.to_datetime(df_est.index),inplace=True)
 
-df_train=df.loc[:,shifted].join(df_est)
+dfDemanda = qryDem[(qryDem['REGION']==region)] #extraigo demanda para la region actual
+dfDemanda['dDEMANDA'] = dfDemanda['DEMANDA'].diff(1)
+dfDemanda.dropna(axis=0,inplace=True)
 
+dfDemanda = dfDemanda.join(dfEst,how='inner') #join con datos meteorologicos
+
+#aplico un filtro de suavizado de las var meteorologicas
+smVar=['TEMP','PNM','DD','FF','HUM']
+for i in smVar:
+    dfDemanda[i]=savgol_filter(dfDemanda[i].values,11,2)
+
+
+
+dfDemanda['TEMP2'] = dfDemanda['TEMP']**2
+dfDemanda['TEMP3'] = dfDemanda['TEMP']**3
+
+
+
+dfDemanda['MES'] = dfDemanda.index.month
+dfDemanda['TIPODIA'] = dfDemanda.index.dayofweek 
+
+dfDemanda = dfDemanda.join(dfFer)
+
+
+## FERIADOS
+dfDemanda['Feriado'].fillna(0,inplace=True)
+dfDemanda['L.Feriado']=dfDemanda['Feriado'].shift(24)
+dfDemanda['F.Feriado']=dfDemanda['Feriado'].shift(-24)
+dfDemanda['F.Feriado'].fillna(0,inplace=True) #el día posterior al último dato no se considera feriado
+dfDemanda['L.Feriado'].fillna(0,inplace=True) #el día anteriro al primer dato no se considera feriado
+
+# # VALORES REZAGADOS
+# shifted=[]
+
+# for i in range(1,4):
+#     dfDemanda['L{}.Dem'.format(i)]=dfDemanda['DEMANDA'].shift(i)
+#     shifted.append('L{}.Dem'.format(i))
+# dfDemanda.drop(dfDemanda.head(4).index, axis=0,inplace=True)
 
 #%%
 
-from xgboost.sklearn import XGBRegressor
+#Lista de features 
+featMeteo = ['TEMP','TEMP2','TEMP3','PNM','DD','FF','HUM']
+featCat = ['HORA', 'TIPODIA','MES']
+featFeriado = ['Feriado', 'L.Feriado','F.Feriado']
 
-df_train.dropna(axis=0,inplace=True)
+feats = featMeteo + featCat + featFeriado #+ shifted
 
-original = ['TEMP','Hora','TipoDia','Mes','Feriado','L.Feriado','F.Feriado']#,'PNM','DD','FF',
-feats = original + shifted
 
-since_day = '12-31-2016'
-split_day='10-01-2019'
-to_day='12-01-2019'
+# DROPEO COLAPSO SI ESTA EN EL DATASET
+try:
+    dfDemanda.drop(dfDemanda.loc['2019-06-16',].index,axis=0,inplace=True) 
+except: 
+    pass
 
 #Separacion TRAIN - TEST
-X_train = azul.loc[since_day:split_day,feats]
-y_train = azul.loc[since_day:split_day,'Dem']
-X_test = azul.loc[split_day:to_day,feats]
-y_test = azul.loc[split_day:to_day,'Dem']
+#Parte vieja
+# X_train = dfDemanda.loc[sinceDay:spDay,feats]
+# y_train = dfDemanda.loc[sinceDay:spDay,'DEMANDA']
+# X_test = dfDemanda.loc[spDay:,feats]
+# y_test = dfDemanda.loc[spDay:,'DEMANDA']
 
-print(np.shape(X_train),np.shape(y_train),np.shape(X_test),np.shape(y_test))
+X_train, X_test, y_train, y_test = train_test_split(dfDemanda.loc[since_day:,feats],
+                                                    dfDemanda.loc[since_day:,'DEMANDA'],
+                                                    test_size=0.15,random_state=42)
 
-from sklearn.model_selection import GridSearchCV
 
+#Instancio el modelo para el GridSearch
 model = XGBRegressor(booster ='gbtree',objective = 'reg:squarederror')
 
 param={
-    'learning_rate':[0.1,],
+    'learning_rate':[0.1],
     'max_depth':[5,7],
-    'n_estimators':[800],
-    'colsample_bytree':[0.9],
-    'subsample':[0.9],
+    'n_estimators':[400],
+    'colsample_bytree':[0.7,0.9],
+    'subsample':[0.7,0.9],
     'gamma':[0], #min_split_loss
-    'reg_lambda':[30], #reg L2
-    'reg_alpha':[0] #reg L1
+    'reg_lambda':[30,50,100], #reg L2
+    'reg_alpha':[0,10] #reg L1
 }
 
 xgb_grid = GridSearchCV(model, param, cv=3 , verbose=False)
 
 #%%
+
+#AJUSTO LOS MEJORES PARAMETROS CON GRID SEARCH
 xgb_grid.fit(X_train, y_train, 
         eval_set = [(X_test, y_test)], 
         early_stopping_rounds = 10, 
         verbose=True)
 
-best_param=xgb_grid.best_params_
+bestParams = xgb_grid.best_params_ #me guardo el dict
 
 print(xgb_grid.best_score_)
 print(xgb_grid.best_params_)
 
 #%%
 
-best_model=XGBRegressor(booster ='gbtree',
-                        objective = 'reg:squarederror',
-                        **xgb_grid.best_params_)
+bestParams['n_estimators']=1000
+bestParams['learning_rate']=0.01
 
-best_model.fit(X_train, y_train, 
+bestModel=XGBRegressor(booster ='gbtree',
+                        objective = 'reg:squarederror',
+                        **bestParams)
+
+bestModel.fit(X_train, y_train, 
         eval_set = [(X_test, y_test)], 
         early_stopping_rounds = 20, 
         verbose=True)
 
+bestModel.save_model(region,'_xgb.json')
+
+#%%
+# 
+# fig,ax = plt.subplots()
+
+# start='2021-08-01 00'
+# end='2021-08-08'
+
+# idx = X_test.loc[start:end,].index
+# yPred = best_model.predict(X_test.loc[start:end,])
+# yTrue = y_test.loc[start:end,].values
+
+# ax.plot(idx, yPred, linewidth=1, label='y_pred')
+# ax.plot(idx,yTrue,label='y_test')
+
+# ax.legend(loc='lower right',frameon=False)
+
 #%%
 
-fig,ax = plt.subplots()
+plt.scatter(X_test.loc[start:end,'MES'],(yTrue-yPred))
 
-ax.plot(X_test.index,best_model.predict(X_test), linewidth=1, label='y_pred')
-ax.plot(X_test.index,y_test.values,label='y_test')
+#%%
 
-ax.legend(loc='lower right',frameon=False)
+# dfDemanda.loc[start,'DEMANDA']
+
+# yPred2 = yPred
+
+# yPred2[0] = yPred[0] + dfDemanda.loc[y_train.index[-2],'DEMANDA']
+
+# for i in range(1,len(yPred)):
+#     yPred2[i]=yPred2[i]+yPred2[i-1]
+
+
+# plt.plot(idx, yPred2, linewidth=1, label='y_pred')
+# plt.plot(idx, dfDemanda.loc[start:end,'DEMANDA'],label='y_test')
+# plt.legend(loc='lower right',frameon=False)
+
+
+
+
+
